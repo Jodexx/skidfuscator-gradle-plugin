@@ -104,7 +104,7 @@ public class SkidfuscatorPlugin implements Plugin<Project> {
                     skidJar.getParentFile().mkdirs();
                 }
                 // If version changed or jar not present, re-download
-                if (!"dev".equalsIgnoreCase(resolvedVersion) && resolvedVersion.equals(currentVersion) || !skidJar.exists()) {
+                if (!"dev".equalsIgnoreCase(resolvedVersion) && !resolvedVersion.equals(currentVersion) || !skidJar.exists()) {
                     project.getLogger().warn("Could not find Skidfuscator jar at " + skidJar.getAbsolutePath() + ", downloading...");
                     project.getLogger().lifecycle("Downloading Skidfuscator " + resolvedVersion + "...");
                     try {
