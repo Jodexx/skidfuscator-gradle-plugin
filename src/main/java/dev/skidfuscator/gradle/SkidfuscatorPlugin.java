@@ -31,9 +31,9 @@ public class SkidfuscatorPlugin implements Plugin<Project> {
         SkidfuscatorExtension extension = project.getExtensions().create("skidfuscator", SkidfuscatorExtension.class, transformerContainer);
 
         project.afterEvaluate(p -> {
-            Task jarTask = p.getTasks().findByName("jar");
-            Task shadowJarTask = p.getTasks().findByName("shadowJar");
-            Task finalTask = (shadowJarTask != null) ? shadowJarTask : jarTask;
+            Jar jarTask = p.getTasks().withType(Jar.class).findByName("jar");
+            Jar shadowJarTask = p.getTasks().withType(Jar.class).findByName("shadowJar");
+            Jar finalTask = (shadowJarTask != null) ? shadowJarTask : jarTask;
 
             if (finalTask == null) {
                 project.getLogger().lifecycle("No jar or shadowJar task found. Skidfuscator will not run automatically.");
@@ -116,12 +116,7 @@ public class SkidfuscatorPlugin implements Plugin<Project> {
                     }
                 }
 
-                File outputJar;
-                if (shadowJarTask != null) {
-                    outputJar = new File(p.getBuildDir(), "libs/" + p.getName() + "-" + p.getVersion() + "-all.jar");
-                } else {
-                    outputJar = new File(p.getBuildDir(), "libs/" + p.getName() + "-" + p.getVersion() + ".jar");
-                }
+                File outputJar = finalTask.getArchiveFile().get().getAsFile();
 
                 if (!outputJar.exists()) {
                     project.getLogger().lifecycle("Output jar not found at " + outputJar.getAbsolutePath() + ", cannot run Skidfuscator.");
