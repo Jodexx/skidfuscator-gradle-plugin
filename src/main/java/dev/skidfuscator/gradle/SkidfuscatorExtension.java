@@ -11,6 +11,7 @@ import java.util.List;
 @Setter
 public class SkidfuscatorExtension {
     private List<String> exempt = new ArrayList<>();
+    private List<String> exclude = new ArrayList<>();
     private List<String> libs = new ArrayList<>();
 
     // Dynamic transformers container

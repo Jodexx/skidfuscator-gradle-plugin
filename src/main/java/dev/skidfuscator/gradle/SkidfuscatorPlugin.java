@@ -272,6 +272,7 @@ public class SkidfuscatorPlugin implements Plugin<Project> {
     private Config buildConfig(SkidfuscatorExtension ext) {
         Map<String, Object> rootMap = new HashMap<>();
         rootMap.put("exempt", ext.getExempt());
+        rootMap.put("exclude", ext.getExclude());
         rootMap.put("libraries", ext.getLibs());
 
         // Dynamically add transformers
