@@ -3,30 +3,37 @@ package dev.skidfuscator.gradle;
 import com.typesafe.config.Config;
 import com.typesafe.config.ConfigFactory;
 import com.typesafe.config.ConfigRenderOptions;
-import com.typesafe.config.ConfigValueFactory;
 import dev.skidfuscator.dependanalysis.DependencyAnalyzer;
 import dev.skidfuscator.dependanalysis.DependencyResult;
 import org.gradle.api.NamedDomainObjectContainer;
 import org.gradle.api.Plugin;
 import org.gradle.api.Project;
 import org.gradle.api.Task;
+import org.gradle.api.artifacts.ResolvedArtifact;
 import org.gradle.jvm.tasks.Jar;
+import org.gradle.process.ExecOperations;
 import org.jetbrains.annotations.NotNull;
 
+import javax.inject.Inject;
 import java.io.*;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
 import java.util.stream.Collectors;
 
 public class SkidfuscatorPlugin implements Plugin<Project> {
+
+    @Inject
+    ExecOperations exec;
+
     @Override
     public void apply(@NotNull Project project) {
         this.addExclude(project);
 
         NamedDomainObjectContainer<TransformerSpec> transformerContainer =
-                project.getObjects().domainObjectContainer(TransformerSpec.class, name -> new TransformerSpec(name));
+                project.getObjects().domainObjectContainer(TransformerSpec.class, TransformerSpec::new);
 
         SkidfuscatorExtension extension = project.getExtensions().create("skidfuscator", SkidfuscatorExtension.class, transformerContainer);
 
@@ -43,7 +50,7 @@ public class SkidfuscatorPlugin implements Plugin<Project> {
             // Add new task to collect dependencies
             Task collectDependencies = p.getTasks().create("collectSkidfuscatorDependencies", task -> {
                 task.doLast(t -> {
-                    File depsDir = new File(p.getBuildDir(), "skidfuscator/dependencies");
+                    File depsDir = new File(p.getLayout().getBuildDirectory().get().getAsFile(), "skidfuscator/dependencies");
                     if (!depsDir.exists()) {
                         depsDir.mkdirs();
                     }
@@ -56,7 +63,7 @@ public class SkidfuscatorPlugin implements Plugin<Project> {
                             .getResolvedConfiguration()
                             .getResolvedArtifacts()
                             .stream()
-                            .map(artifact -> artifact.getFile())
+                            .map(ResolvedArtifact::getFile)
                             .collect(Collectors.toSet());
 
                     // Log the initial list of dependencies
@@ -83,16 +90,16 @@ public class SkidfuscatorPlugin implements Plugin<Project> {
                 // Run the collect dependencies task first
                 collectDependencies.getActions().forEach(action -> action.execute(task));
 
-                File skidDir = new File(p.getBuildDir(), "skidfuscator");
+                File skidDir = new File(p.getLayout().getBuildDirectory().get().getAsFile(), "skidfuscator");
                 if (!skidDir.exists()) {
                     skidDir.mkdirs();
                 }
 
                 String resolvedVersion;
                 try {
-                    resolvedVersion = resolveVersion(extension.getSkidfuscatorVersion());
+                    resolvedVersion = resolveVersion(extension.getSkidfuscatorVersion().get());
                 } catch (IOException e) {
-                    project.getLogger().error("Failed to fetch latest Skidfuscator version: " + e.getMessage());
+                    project.getLogger().error("Failed to fetch latest Skidfuscator version: {}", e.getMessage());
                     return;
                 }
 
@@ -116,7 +123,7 @@ public class SkidfuscatorPlugin implements Plugin<Project> {
                     }
                 }
 
-                File outputJar = finalTask.getArchiveFile().get().getAsFile();
+                File outputJar = new File(extension.getInput().get());
 
                 if (!outputJar.exists()) {
                     project.getLogger().lifecycle("Output jar not found at " + outputJar.getAbsolutePath() + ", cannot run Skidfuscator.");
@@ -124,9 +131,9 @@ public class SkidfuscatorPlugin implements Plugin<Project> {
                 }
 
                 // Add the dependencies directory as the single libs folder
-                File depsDir = new File(p.getBuildDir(), "skidfuscator/dependencies");
+                File depsDir = new File(p.getLayout().getBuildDirectory().get().getAsFile(), "skidfuscator/dependencies");
                 if (depsDir.exists() && depsDir.listFiles().length > 0) {
-                    final List<String> reduced = new ArrayList<>();
+                    final List<String> reduced;
                     final DependencyAnalyzer analyzer = new DependencyAnalyzer(
                             outputJar.toPath(),
                             depsDir.toPath()
@@ -149,10 +156,9 @@ public class SkidfuscatorPlugin implements Plugin<Project> {
                             project.getLogger().lifecycle("");
                         }
                         project.getLogger().lifecycle("Reducing dependencies...");
-                        reduced.addAll(result.getJarDependencies().stream()
+                        reduced = result.getJarDependencies().stream()
                                 .map(DependencyResult.JarDependency::getJarPath)
-                                .map(Path::toString)
-                                .collect(Collectors.toList()));
+                                .map(Path::toString).collect(Collectors.toList());
                         project.getLogger().lifecycle("Reduced dependencies (" + reduced.size() + "):");
                     } catch (IOException e) {
                         project.getLogger().error("Failed to minimize analyzed dependencies: " + e.getMessage(), e);
@@ -162,7 +168,7 @@ public class SkidfuscatorPlugin implements Plugin<Project> {
                     extension.getLibs().addAll(reduced);
                 }
 
-                File configFile = new File(skidDir, extension.getConfigFileName());
+                File configFile = new File(skidDir, extension.getConfigFileName().get());
                 try {
                     writeHoconConfig(extension, configFile);
                 } catch (IOException e) {
@@ -170,8 +176,8 @@ public class SkidfuscatorPlugin implements Plugin<Project> {
                     return;
                 }
 
-                File resultJar = (extension.getOutput() != null)
-                        ? new File(extension.getOutput())
+                File resultJar = (extension.getOutput().isPresent())
+                        ? new File(extension.getOutput().get())
                         : new File(outputJar.getParentFile(), outputJar.getName().replace(".jar", "-obf.jar"));
 
                 List<String> args = new ArrayList<>();
@@ -180,13 +186,13 @@ public class SkidfuscatorPlugin implements Plugin<Project> {
                 args.add("-o"); args.add(resultJar.getAbsolutePath());
                 args.add("--debug");
 
-                if (extension.isPhantom()) args.add("-ph");
-                if (extension.isFuckit()) args.add("-fuckit");
-                if (extension.isDebug()) args.add("-dbg");
-                if (extension.isNotrack()) args.add("-notrack");
+                if (extension.getPhantom().get()) args.add("-ph");
+                if (extension.getFuckit().get()) args.add("-fuckit");
+                if (extension.getDebug().get()) args.add("-dbg");
+                if (extension.getNotrack().get()) args.add("-notrack");
 
                 if (extension.getRuntime() != null) {
-                    File rt = new File(extension.getRuntime());
+                    File rt = new File(extension.getRuntime().get());
                     if (rt.exists()) {
                         args.add("-rt");
                         args.add(rt.getAbsolutePath());
@@ -197,7 +203,8 @@ public class SkidfuscatorPlugin implements Plugin<Project> {
                 args.add(outputJar.getAbsolutePath());
 
                 project.getLogger().lifecycle("Running Skidfuscator...");
-                project.exec(spec -> {
+
+                exec.exec(spec -> {
                     spec.setExecutable("java");
                     List<String> fullArgs = new ArrayList<>();
                     fullArgs.add("-jar");
@@ -241,7 +248,7 @@ public class SkidfuscatorPlugin implements Plugin<Project> {
     private void downloadSkidfuscatorJar(String version, File target) throws IOException {
         String urlStr = "https://github.com/skidfuscatordev/skidfuscator-java-obfuscator/releases/download/" + version + "/skidfuscator.jar";
         URL url = new URL(urlStr);
-        try (InputStream in = url.openStream(); OutputStream out = new FileOutputStream(target)) {
+        try (InputStream in = url.openStream(); OutputStream out = Files.newOutputStream(target.toPath())) {
             byte[] buffer = new byte[8192];
             int read;
             while ((read = in.read(buffer)) != -1) {
