@@ -29,6 +29,10 @@ public class SkidfuscatorExtension {
     private final Property<Boolean> notrack;
     @Getter
     private final Property<String> runtime;
+    @Getter
+    private final Property<Integer> javaVersion;
+    @Getter
+    private final Property<String> javaExecutable;
 
     @Getter
     private final Property<String> input;
@@ -50,16 +54,18 @@ public class SkidfuscatorExtension {
         this.debug = objects.property(Boolean.class);
         this.notrack = objects.property(Boolean.class);
         this.runtime = objects.property(String.class);
+        this.javaVersion = objects.property(Integer.class);
+        this.javaExecutable = objects.property(String.class);
         this.input = objects.property(String.class);
         this.output = objects.property(String.class);
         this.configFileName = objects.property(String.class);
         this.skidfuscatorVersion = objects.property(String.class);
 
-        // Встановлюємо значення за замовчуванням
         this.phantom.convention(false);
         this.fuckit.convention(false);
         this.debug.convention(false);
         this.notrack.convention(false);
+        this.javaExecutable.convention("java");
         this.configFileName.convention("skidfuscator.conf");
         this.skidfuscatorVersion.convention("latest");
 

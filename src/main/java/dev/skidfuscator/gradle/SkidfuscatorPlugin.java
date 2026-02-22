@@ -11,6 +11,9 @@ import org.gradle.api.Project;
 import org.gradle.api.Task;
 import org.gradle.api.artifacts.ResolvedArtifact;
 import org.gradle.jvm.tasks.Jar;
+import org.gradle.jvm.toolchain.JavaLanguageVersion;
+import org.gradle.jvm.toolchain.JavaLauncher;
+import org.gradle.jvm.toolchain.JavaToolchainService;
 import org.gradle.process.ExecOperations;
 import org.jetbrains.annotations.NotNull;
 
@@ -23,10 +26,13 @@ import java.nio.file.Path;
 import java.util.*;
 import java.util.stream.Collectors;
 
-public class SkidfuscatorPlugin implements Plugin<Project> {
+public abstract class SkidfuscatorPlugin implements Plugin<Project> {
 
     @Inject
-    ExecOperations exec;
+    protected abstract ExecOperations getExecOperations();
+
+    @Inject
+    protected abstract JavaToolchainService getJavaToolchainService();
 
     @Override
     public void apply(@NotNull Project project) {
@@ -47,176 +53,241 @@ public class SkidfuscatorPlugin implements Plugin<Project> {
                 return;
             }
 
-            // Add new task to collect dependencies
-            Task collectDependencies = p.getTasks().create("collectSkidfuscatorDependencies", task -> {
+            final File buildDir = p.getLayout().getBuildDirectory().get().getAsFile();
+            final File projectDir = p.getProjectDir();
+            final List<File> compileClasspathDependencies = p.getConfigurations().getByName("compileClasspath")
+                    .getResolvedConfiguration()
+                    .getResolvedArtifacts()
+                    .stream()
+                    .map(ResolvedArtifact::getFile)
+                    .collect(Collectors.toList());
+            final SkidfuscatorExecutionConfig executionConfig = snapshotExtension(extension);
+
+            Task runSkidfuscator = p.getTasks().create("runSkidfuscator", task -> {
+                task.dependsOn(finalTask);
                 task.doLast(t -> {
-                    File depsDir = new File(p.getLayout().getBuildDirectory().get().getAsFile(), "skidfuscator/dependencies");
-                    if (!depsDir.exists()) {
-                        depsDir.mkdirs();
+                    File depsDir = new File(buildDir, "skidfuscator/dependencies");
+                    collectDependencies(compileClasspathDependencies, depsDir, t.getLogger());
+
+                    File skidDir = new File(buildDir, "skidfuscator");
+                    if (!skidDir.exists()) {
+                        skidDir.mkdirs();
                     }
 
-                    // Clear existing files
-                    Arrays.stream(depsDir.listFiles()).forEach(File::delete);
+                    String resolvedVersion;
+                    try {
+                        resolvedVersion = resolveVersion(executionConfig.skidfuscatorVersion);
+                    } catch (IOException e) {
+                        t.getLogger().error("Failed to fetch latest Skidfuscator version: {}", e.getMessage());
+                        return;
+                    }
 
-                    // Collect all runtime dependencies
-                    Set<File> deps = p.getConfigurations().getByName("compileClasspath")
-                            .getResolvedConfiguration()
-                            .getResolvedArtifacts()
-                            .stream()
-                            .map(ResolvedArtifact::getFile)
-                            .collect(Collectors.toSet());
+                    File versionFile = new File(skidDir, ".version");
+                    String currentVersion = readVersionFile(versionFile);
 
-                    // Log the initial list of dependencies
-                    project.getLogger().lifecycle("Initial dependencies collected (" + deps.size() + "):");
-                    deps.forEach(dep -> project.getLogger().lifecycle(" - " + dep.getAbsolutePath()));
-
-                    // Copy dependencies to the deps directory
-                    for (File dep : deps) {
+                    File skidJar = new File(projectDir, ".skidfuscator/skidfuscator-" + resolvedVersion + ".jar");
+                    if (!skidJar.getParentFile().exists()) {
+                        skidJar.getParentFile().mkdirs();
+                    }
+                    // If version changed or jar not present, re-download
+                    if (!"dev".equalsIgnoreCase(resolvedVersion) && !resolvedVersion.equals(currentVersion) || !skidJar.exists()) {
+                        t.getLogger().warn("Could not find Skidfuscator jar at " + skidJar.getAbsolutePath() + ", downloading...");
+                        t.getLogger().lifecycle("Downloading Skidfuscator " + resolvedVersion + "...");
                         try {
-                            File destFile = new File(depsDir, dep.getName());
-                            java.nio.file.Files.copy(
-                                dep.toPath(),
-                                destFile.toPath(),
-                                java.nio.file.StandardCopyOption.REPLACE_EXISTING
-                            );
+                            downloadSkidfuscatorJar(resolvedVersion, skidJar);
+                            writeVersionFile(versionFile, resolvedVersion);
                         } catch (IOException e) {
-                            project.getLogger().warn("Failed to copy dependency: " + dep.getName(), e);
+                            t.getLogger().error("Failed to download Skidfuscator: " + e.getMessage(), e);
+                            return;
                         }
                     }
-                });
-            });
 
-            finalTask.doLast(task -> {
-                // Run the collect dependencies task first
-                collectDependencies.getActions().forEach(action -> action.execute(task));
-
-                File skidDir = new File(p.getLayout().getBuildDirectory().get().getAsFile(), "skidfuscator");
-                if (!skidDir.exists()) {
-                    skidDir.mkdirs();
-                }
-
-                String resolvedVersion;
-                try {
-                    resolvedVersion = resolveVersion(extension.getSkidfuscatorVersion().get());
-                } catch (IOException e) {
-                    project.getLogger().error("Failed to fetch latest Skidfuscator version: {}", e.getMessage());
-                    return;
-                }
-
-                File versionFile = new File(skidDir, ".version");
-                String currentVersion = readVersionFile(versionFile);
-
-                File skidJar = new File(p.getProjectDir(), ".skidfuscator/skidfuscator-" + resolvedVersion + ".jar");
-                if (!skidJar.getParentFile().exists()) {
-                    skidJar.getParentFile().mkdirs();
-                }
-                // If version changed or jar not present, re-download
-                if (!"dev".equalsIgnoreCase(resolvedVersion) && !resolvedVersion.equals(currentVersion) || !skidJar.exists()) {
-                    project.getLogger().warn("Could not find Skidfuscator jar at " + skidJar.getAbsolutePath() + ", downloading...");
-                    project.getLogger().lifecycle("Downloading Skidfuscator " + resolvedVersion + "...");
-                    try {
-                        downloadSkidfuscatorJar(resolvedVersion, skidJar);
-                        writeVersionFile(versionFile, resolvedVersion);
-                    } catch (IOException e) {
-                        project.getLogger().error("Failed to download Skidfuscator: " + e.getMessage(), e);
+                    if (executionConfig.input == null || executionConfig.input.trim().isEmpty()) {
+                        t.getLogger().lifecycle("No skidfuscator.input configured, skipping obfuscation.");
                         return;
                     }
-                }
 
-                File outputJar = new File(extension.getInput().get());
+                    File outputJar = new File(executionConfig.input);
 
-                if (!outputJar.exists()) {
-                    project.getLogger().lifecycle("Output jar not found at " + outputJar.getAbsolutePath() + ", cannot run Skidfuscator.");
-                    return;
-                }
+                    if (!outputJar.exists()) {
+                        t.getLogger().lifecycle("Output jar not found at " + outputJar.getAbsolutePath() + ", cannot run Skidfuscator.");
+                        return;
+                    }
 
-                // Add the dependencies directory as the single libs folder
-                File depsDir = new File(p.getLayout().getBuildDirectory().get().getAsFile(), "skidfuscator/dependencies");
-                if (depsDir.exists() && depsDir.listFiles().length > 0) {
-                    final List<String> reduced;
-                    final DependencyAnalyzer analyzer = new DependencyAnalyzer(
-                            outputJar.toPath(),
-                            depsDir.toPath()
-                    );
+                    // Add the dependencies directory as the single libs folder
+                    List<String> effectiveLibs = new ArrayList<>(executionConfig.libs);
+                    File[] copiedDependencies = depsDir.listFiles();
+                    if (depsDir.exists() && copiedDependencies != null && copiedDependencies.length > 0) {
+                        List<String> reduced;
+                        final DependencyAnalyzer analyzer = new DependencyAnalyzer(
+                                outputJar.toPath(),
+                                depsDir.toPath()
+                        );
 
-                    try {
-                        final DependencyResult result = analyzer.analyze();
-                        for(DependencyResult.JarDependency jarDependency : result.getJarDependencies()) {
-                            project.getLogger().lifecycle("JAR: " + jarDependency.getJarPath().getFileName());
-                            project.getLogger().lifecycle("---------------------------------------------------");
+                        try {
+                            final DependencyResult result = analyzer.analyze();
+                            for(DependencyResult.JarDependency jarDependency : result.getJarDependencies()) {
+                                t.getLogger().lifecycle("JAR: " + jarDependency.getJarPath().getFileName());
+                                t.getLogger().lifecycle("---------------------------------------------------");
 
-                            for(DependencyResult.ClassDependency classDep : jarDependency.getClassesNeeded()) {
-                                project.getLogger().lifecycle("  Class: " + classDep.getClassName());
+                                for(DependencyResult.ClassDependency classDep : jarDependency.getClassesNeeded()) {
+                                    t.getLogger().lifecycle("  Class: " + classDep.getClassName());
 
-                                for(String reason : classDep.getReasons()) {
-                                    project.getLogger().lifecycle("    - " + reason);
+                                    for(String reason : classDep.getReasons()) {
+                                        t.getLogger().lifecycle("    - " + reason);
+                                    }
                                 }
-                            }
 
-                            project.getLogger().lifecycle("");
+                                t.getLogger().lifecycle("");
+                            }
+                            t.getLogger().lifecycle("Reducing dependencies...");
+                            reduced = result.getJarDependencies().stream()
+                                    .map(DependencyResult.JarDependency::getJarPath)
+                                    .map(Path::toString).collect(Collectors.toList());
+                            t.getLogger().lifecycle("Reduced dependencies (" + reduced.size() + "):");
+                        } catch (Exception e) {
+                            t.getLogger().warn("Failed to minimize analyzed dependencies, falling back to full dependency set: " + e.getMessage(), e);
+                            Arrays.stream(copiedDependencies)
+                                    .map(File::getAbsolutePath)
+                                    .forEach(effectiveLibs::add);
+                            reduced = Collections.emptyList();
                         }
-                        project.getLogger().lifecycle("Reducing dependencies...");
-                        reduced = result.getJarDependencies().stream()
-                                .map(DependencyResult.JarDependency::getJarPath)
-                                .map(Path::toString).collect(Collectors.toList());
-                        project.getLogger().lifecycle("Reduced dependencies (" + reduced.size() + "):");
+
+                        effectiveLibs.addAll(reduced);
+                    }
+
+                    File configFile = new File(skidDir, executionConfig.configFileName);
+                    try {
+                        writeHoconConfig(executionConfig, effectiveLibs, configFile);
                     } catch (IOException e) {
-                        project.getLogger().error("Failed to minimize analyzed dependencies: " + e.getMessage(), e);
+                        t.getLogger().error("Failed to write config file: " + e.getMessage(), e);
                         return;
                     }
 
-                    extension.getLibs().addAll(reduced);
-                }
+                    File resultJar = (executionConfig.output != null && !executionConfig.output.trim().isEmpty())
+                            ? new File(executionConfig.output)
+                            : new File(outputJar.getParentFile(), outputJar.getName().replace(".jar", "-obf.jar"));
 
-                File configFile = new File(skidDir, extension.getConfigFileName().get());
-                try {
-                    writeHoconConfig(extension, configFile);
-                } catch (IOException e) {
-                    project.getLogger().error("Failed to write config file: " + e.getMessage(), e);
-                    return;
-                }
+                    List<String> args = new ArrayList<>();
+                    args.add("obfuscate");
+                    args.add("-cfg"); args.add(configFile.getAbsolutePath());
+                    args.add("-o"); args.add(resultJar.getAbsolutePath());
+                    args.add("--debug");
 
-                File resultJar = (extension.getOutput().isPresent())
-                        ? new File(extension.getOutput().get())
-                        : new File(outputJar.getParentFile(), outputJar.getName().replace(".jar", "-obf.jar"));
+                    if (executionConfig.phantom) args.add("-ph");
+                    if (executionConfig.fuckit) args.add("-fuckit");
+                    if (executionConfig.debug) args.add("-dbg");
+                    if (executionConfig.notrack) args.add("-notrack");
 
-                List<String> args = new ArrayList<>();
-                args.add("obfuscate");
-                args.add("-cfg"); args.add(configFile.getAbsolutePath());
-                args.add("-o"); args.add(resultJar.getAbsolutePath());
-                args.add("--debug");
-
-                if (extension.getPhantom().get()) args.add("-ph");
-                if (extension.getFuckit().get()) args.add("-fuckit");
-                if (extension.getDebug().get()) args.add("-dbg");
-                if (extension.getNotrack().get()) args.add("-notrack");
-
-                if (extension.getRuntime() != null) {
-                    File rt = new File(extension.getRuntime().get());
-                    if (rt.exists()) {
-                        args.add("-rt");
-                        args.add(rt.getAbsolutePath());
+                    if (executionConfig.runtime != null && !executionConfig.runtime.trim().isEmpty()) {
+                        File rt = new File(executionConfig.runtime);
+                        if (rt.exists()) {
+                            args.add("-rt");
+                            args.add(rt.getAbsolutePath());
+                        }
                     }
-                }
 
-                // Input jar last
-                args.add(outputJar.getAbsolutePath());
+                    // Input jar last
+                    args.add(outputJar.getAbsolutePath());
 
-                project.getLogger().lifecycle("Running Skidfuscator...");
+                    t.getLogger().lifecycle("Running Skidfuscator...");
 
-                exec.exec(spec -> {
-                    spec.setExecutable("java");
-                    List<String> fullArgs = new ArrayList<>();
-                    fullArgs.add("-jar");
-                    fullArgs.add(skidJar.getAbsolutePath());
-                    fullArgs.addAll(args);
-                    spec.setArgs(fullArgs);
-                    spec.setIgnoreExitValue(false);
+                    final String javaExecutable;
+                    try {
+                        javaExecutable = resolveJavaExecutable(executionConfig, t.getLogger());
+                    } catch (RuntimeException e) {
+                        t.getLogger().error(e.getMessage(), e);
+                        return;
+                    }
+
+                    getExecOperations().exec(spec -> {
+                        spec.setExecutable(javaExecutable);
+                        List<String> fullArgs = new ArrayList<>();
+                        fullArgs.add("-jar");
+                        fullArgs.add(skidJar.getAbsolutePath());
+                        fullArgs.addAll(args);
+                        spec.setArgs(fullArgs);
+                        spec.setIgnoreExitValue(false);
+                    });
+
+                    t.getLogger().lifecycle("Skidfuscation complete! Obfuscated jar at " + resultJar.getAbsolutePath());
                 });
-
-                project.getLogger().lifecycle("Skidfuscation complete! Obfuscated jar at " + resultJar.getAbsolutePath());
             });
+
+            finalTask.finalizedBy(runSkidfuscator);
         });
+    }
+
+    private SkidfuscatorExecutionConfig snapshotExtension(SkidfuscatorExtension extension) {
+        Map<String, Object> transformerMap = new HashMap<>();
+        extension.getTransformers().getTransformers().forEach(spec ->
+                transformerMap.put(spec.getName(), new HashMap<>(spec.getProperties()))
+        );
+
+        return new SkidfuscatorExecutionConfig(
+                new ArrayList<>(extension.getExempt().getOrElse(Collections.emptyList())),
+                new ArrayList<>(extension.getExclude().getOrElse(Collections.emptyList())),
+                new ArrayList<>(extension.getLibs().getOrElse(Collections.emptyList())),
+                transformerMap,
+                extension.getPhantom().getOrElse(false),
+                extension.getFuckit().getOrElse(false),
+                extension.getDebug().getOrElse(false),
+                extension.getNotrack().getOrElse(false),
+                extension.getRuntime().getOrNull(),
+                extension.getInput().getOrNull(),
+                extension.getOutput().getOrNull(),
+                extension.getConfigFileName().getOrElse("skidfuscator.conf"),
+                extension.getSkidfuscatorVersion().getOrElse("latest"),
+                extension.getJavaVersion().getOrNull(),
+                extension.getJavaExecutable().getOrElse("java")
+        );
+    }
+
+    private String resolveJavaExecutable(SkidfuscatorExecutionConfig executionConfig, org.gradle.api.logging.Logger logger) {
+        if (executionConfig.javaVersion != null) {
+            final Integer javaVersion = executionConfig.javaVersion;
+            try {
+                JavaLauncher launcher = getJavaToolchainService().launcherFor(spec ->
+                        spec.getLanguageVersion().set(JavaLanguageVersion.of(javaVersion))
+                ).get();
+
+                String executable = launcher.getExecutablePath().getAsFile().getAbsolutePath();
+                logger.lifecycle("Using Java toolchain version " + javaVersion + " for Skidfuscator.");
+                return executable;
+            } catch (Exception e) {
+                throw new IllegalStateException("Failed to resolve Java toolchain version " + javaVersion + " for Skidfuscator.", e);
+            }
+        }
+
+        if (executionConfig.javaExecutable != null && !executionConfig.javaExecutable.trim().isEmpty()) {
+            return executionConfig.javaExecutable;
+        }
+
+        return "java";
+    }
+
+    private void collectDependencies(List<File> dependencies, File depsDir, org.gradle.api.logging.Logger logger) {
+        if (!depsDir.exists() && !depsDir.mkdirs()) {
+            logger.warn("Failed to create dependency directory: {}", depsDir.getAbsolutePath());
+            return;
+        }
+
+        File[] existingFiles = depsDir.listFiles();
+        if (existingFiles != null) {
+            Arrays.stream(existingFiles).forEach(File::delete);
+        }
+
+        logger.lifecycle("Initial dependencies collected (" + dependencies.size() + "):");
+        dependencies.forEach(dep -> logger.lifecycle(" - " + dep.getAbsolutePath()));
+
+        for (File dep : dependencies) {
+            try {
+                File destFile = new File(depsDir, dep.getName());
+                Files.copy(dep.toPath(), destFile.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            } catch (IOException e) {
+                logger.warn("Failed to copy dependency: " + dep.getName(), e);
+            }
+        }
     }
 
     private String resolveVersion(String requestedVersion) throws IOException {
@@ -257,8 +328,8 @@ public class SkidfuscatorPlugin implements Plugin<Project> {
         }
     }
 
-    private void writeHoconConfig(SkidfuscatorExtension ext, File configFile) throws IOException {
-        Config config = buildConfig(ext);
+    private void writeHoconConfig(SkidfuscatorExecutionConfig executionConfig, List<String> libs, File configFile) throws IOException {
+        Config config = buildConfig(executionConfig, libs);
         String rendered = config.root().render(
             ConfigRenderOptions.defaults()
                 .setComments(false)
@@ -271,23 +342,67 @@ public class SkidfuscatorPlugin implements Plugin<Project> {
         }
     }
 
-    private Config buildConfig(SkidfuscatorExtension ext) {
+    private Config buildConfig(SkidfuscatorExecutionConfig executionConfig, List<String> libs) {
         Map<String, Object> rootMap = new HashMap<>();
-        rootMap.put("exempt", ext.getExempt());
-        rootMap.put("exclude", ext.getExclude());
-        rootMap.put("libraries", ext.getLibs());
-
-        // Dynamically add transformers
-        Map<String, Object> transformerMap = new HashMap<>();
-        ext.getTransformers().getTransformers().forEach(spec -> {
-            transformerMap.put(spec.getName(), spec.getProperties());
-        });
-
-        // Merge transformer configs at root
-        rootMap.putAll(transformerMap);
+        rootMap.put("exempt", executionConfig.exempt);
+        rootMap.put("exclude", executionConfig.exclude);
+        rootMap.put("libraries", libs);
+        rootMap.putAll(executionConfig.transformers);
 
         // Parse the map into a Config
         return ConfigFactory.parseMap(rootMap);
+    }
+
+    private static final class SkidfuscatorExecutionConfig {
+        private final List<String> exempt;
+        private final List<String> exclude;
+        private final List<String> libs;
+        private final Map<String, Object> transformers;
+        private final boolean phantom;
+        private final boolean fuckit;
+        private final boolean debug;
+        private final boolean notrack;
+        private final String runtime;
+        private final String input;
+        private final String output;
+        private final String configFileName;
+        private final String skidfuscatorVersion;
+        private final Integer javaVersion;
+        private final String javaExecutable;
+
+        private SkidfuscatorExecutionConfig(
+                List<String> exempt,
+                List<String> exclude,
+                List<String> libs,
+                Map<String, Object> transformers,
+                boolean phantom,
+                boolean fuckit,
+                boolean debug,
+                boolean notrack,
+                String runtime,
+                String input,
+                String output,
+                String configFileName,
+                String skidfuscatorVersion,
+                Integer javaVersion,
+                String javaExecutable
+        ) {
+            this.exempt = exempt;
+            this.exclude = exclude;
+            this.libs = libs;
+            this.transformers = transformers;
+            this.phantom = phantom;
+            this.fuckit = fuckit;
+            this.debug = debug;
+            this.notrack = notrack;
+            this.runtime = runtime;
+            this.input = input;
+            this.output = output;
+            this.configFileName = configFileName;
+            this.skidfuscatorVersion = skidfuscatorVersion;
+            this.javaVersion = javaVersion;
+            this.javaExecutable = javaExecutable;
+        }
     }
 
     private String readVersionFile(File versionFile) {
